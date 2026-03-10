@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+worktrees/
+
+# Agent prompt files (generated per-session by launchers)
+CLAUDE.md
+AGENTS.md
+
+# Experimental artifacts
+dev/
+run.log
+
+# Results file (untracked, each run creates fresh)
+results.tsv
