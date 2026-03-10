@@ -1,6 +1,6 @@
 """
 Plot experiment progression from results.tsv.
-Shows val_nll and seq_recovery improving over successive runs.
+Reads the program.md format: commit, val_nll, memory_gb, status, description.
 
 Usage: uv run plot_results.py
        uv run plot_results.py --save  (saves to results.png instead of displaying)
@@ -25,7 +25,7 @@ import os
 def load_results(path="results.tsv"):
     if not os.path.exists(path):
         print(f"No results file found at {path}")
-        print("Run `uv run train.py` first to generate results.")
+        print("Run experiments first to generate results.")
         sys.exit(1)
 
     rows = []
@@ -33,11 +33,16 @@ def load_results(path="results.tsv"):
         header = f.readline().strip().split("\t")
         for line in f:
             vals = line.strip().split("\t")
+            if len(vals) < 4:
+                continue
             row = dict(zip(header, vals))
+            # Skip crashed runs (val_nll == 0)
+            if row.get("status") == "crash":
+                continue
             rows.append(row)
 
     if not rows:
-        print("results.tsv is empty.")
+        print("results.tsv has no successful runs.")
         sys.exit(1)
 
     return rows
@@ -46,8 +51,8 @@ def load_results(path="results.tsv"):
 def plot(rows, save=False):
     runs = list(range(1, len(rows) + 1))
     val_nll = [float(r["val_nll"]) for r in rows]
-    seq_recovery = [float(r["seq_recovery"]) * 100 for r in rows]
-    perplexity = [float(r["val_perplexity"]) for r in rows]
+    memory_gb = [float(r["memory_gb"]) for r in rows]
+    descriptions = [r.get("description", "") for r in rows]
 
     # Track best val_nll so far
     best_nll = []
@@ -59,7 +64,7 @@ def plot(rows, save=False):
     if save:
         matplotlib.use("Agg")
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
     # val_nll with best-so-far envelope
     axes[0].plot(runs, val_nll, "o-", color="#2196F3", alpha=0.6, label="val_nll")
@@ -70,26 +75,19 @@ def plot(rows, save=False):
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
 
-    # Perplexity
-    axes[1].plot(runs, perplexity, "s-", color="#FF9800")
+    # Memory usage
+    axes[1].bar(runs, memory_gb, color="#FF9800", alpha=0.7)
     axes[1].set_xlabel("Experiment #")
-    axes[1].set_ylabel("Perplexity (lower is better)")
-    axes[1].set_title("Validation Perplexity")
+    axes[1].set_ylabel("Peak VRAM (GB)")
+    axes[1].set_title("Memory Usage")
     axes[1].grid(True, alpha=0.3)
 
-    # Sequence recovery
-    axes[2].plot(runs, seq_recovery, "^-", color="#4CAF50")
-    axes[2].set_xlabel("Experiment #")
-    axes[2].set_ylabel("Seq Recovery % (higher is better)")
-    axes[2].set_title("Sequence Recovery")
-    axes[2].grid(True, alpha=0.3)
-
-    # Annotate each point with key hyperparams
-    for i, r in enumerate(rows):
-        label = f"d{r.get('d_model', '?')}_L{r.get('depth', '?')}"
-        axes[0].annotate(label, (runs[i], val_nll[i]),
+    # Annotate each point with description
+    for i, desc in enumerate(descriptions):
+        short = desc[:20] if len(desc) > 20 else desc
+        axes[0].annotate(short, (runs[i], val_nll[i]),
                          textcoords="offset points", xytext=(0, 8),
-                         fontsize=6, ha="center", alpha=0.7)
+                         fontsize=6, ha="center", alpha=0.7, rotation=30)
 
     plt.tight_layout()
 

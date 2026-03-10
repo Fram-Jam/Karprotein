@@ -339,17 +339,3 @@ if __name__ == "__main__":
     print(f"num_params_M:     {num_params / 1e6:.1f}")
     print(f"depth:            {DEPTH}")
 
-    # Append to results.tsv for cross-experiment tracking
-    results_path = os.path.join(os.path.dirname(__file__), "results.tsv")
-    header_needed = not os.path.exists(results_path)
-    with open(results_path, "a") as f:
-        if header_needed:
-            f.write("run\tval_nll\tval_perplexity\tseq_recovery\t"
-                    "steps\ttraining_s\td_model\tdepth\tnhead\tlr\t"
-                    "dropout\tbatch_residues\tparams_M\tpeak_vram_mb\n")
-        f.write(f"{run_name}\t{metrics['val_nll']:.6f}\t{metrics['val_perplexity']:.6f}\t"
-                f"{metrics['seq_recovery']:.6f}\t{step}\t{total_training_time:.1f}\t"
-                f"{D_MODEL}\t{DEPTH}\t{NHEAD}\t{LEARNING_RATE}\t"
-                f"{DROPOUT}\t{BATCH_MAX_RESIDUES}\t{num_params / 1e6:.1f}\t"
-                f"{peak_vram_mb:.1f}\n")
-    print(f"Results appended to {results_path}")
