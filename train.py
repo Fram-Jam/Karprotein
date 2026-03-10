@@ -10,10 +10,12 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import gc
 import time
 from dataclasses import dataclass, asdict
+from datetime import datetime
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.tensorboard import SummaryWriter
 
 from prepare import NUM_CLASSES, MAX_SEQ_LEN, TIME_BUDGET, make_dataloader, run_validation
 
@@ -143,45 +145,8 @@ FINAL_LR_FRAC = 0.01   # final LR as fraction of initial
 BATCH_MAX_RESIDUES = 4096  # max residues per batch (length-aware)
 
 # ---------------------------------------------------------------------------
-# Setup: model, optimizer, dataloader
+# LR schedule (pure function, importable for testing)
 # ---------------------------------------------------------------------------
-
-t_start = time.time()
-torch.manual_seed(42)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed(42)
-torch.set_float32_matmul_precision("high")
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-use_amp = device.type == "cuda" and torch.cuda.is_bf16_supported()
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16) if use_amp else torch.amp.autocast(device_type="cpu", enabled=False)
-
-config = ModelConfig(
-    d_model=D_MODEL,
-    nhead=NHEAD,
-    num_layers=DEPTH,
-    mlp_ratio=MLP_RATIO,
-    dropout=DROPOUT,
-    max_positions=MAX_SEQ_LEN,
-    num_classes=NUM_CLASSES,
-)
-print(f"Model config: {asdict(config)}")
-
-model = ProteinTransformer(config).to(device)
-num_params = sum(p.numel() for p in model.parameters())
-print(f"Parameters: {num_params:,} ({num_params / 1e6:.1f}M)")
-
-optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-
-if device.type == "cuda":
-    model = torch.compile(model, dynamic=True)
-
-train_loader = make_dataloader("train", batch_max_residues=BATCH_MAX_RESIDUES, device=str(device), shuffle=True)
-batch, epoch = next(train_loader)  # prefetch first batch
-
-print(f"Time budget: {TIME_BUDGET}s")
-print(f"Device: {device}")
-
-# Schedules (all based on progress = training_time / TIME_BUDGET)
 
 def get_lr_multiplier(progress):
     if progress < WARMUP_RATIO:
@@ -193,99 +158,180 @@ def get_lr_multiplier(progress):
         return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
 
 # ---------------------------------------------------------------------------
-# Training loop
+# Main: setup, training loop, final scoring
 # ---------------------------------------------------------------------------
 
-t_start_training = time.time()
-smooth_train_loss = 0
-total_training_time = 0
-step = 0
+if __name__ == "__main__":
+    t_start = time.time()
+    torch.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(42)
+    torch.set_float32_matmul_precision("high")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    use_amp = device.type == "cuda" and torch.cuda.is_bf16_supported()
+    autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16) if use_amp else torch.amp.autocast(device_type="cpu", enabled=False)
 
-while True:
-    model.train()
+    config = ModelConfig(
+        d_model=D_MODEL,
+        nhead=NHEAD,
+        num_layers=DEPTH,
+        mlp_ratio=MLP_RATIO,
+        dropout=DROPOUT,
+        max_positions=MAX_SEQ_LEN,
+        num_classes=NUM_CLASSES,
+    )
+    print(f"Model config: {asdict(config)}")
+
+    model = ProteinTransformer(config).to(device)
+    num_params = sum(p.numel() for p in model.parameters())
+    print(f"Parameters: {num_params:,} ({num_params / 1e6:.1f}M)")
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+
     if device.type == "cuda":
-        torch.cuda.synchronize()
-    t0 = time.time()
+        model = torch.compile(model, dynamic=True)
 
+    train_loader = make_dataloader("train", batch_max_residues=BATCH_MAX_RESIDUES, device=str(device), shuffle=True)
+    batch, epoch = next(train_loader)  # prefetch first batch
+
+    # TensorBoard setup
+    run_name = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_d{D_MODEL}_L{DEPTH}_h{NHEAD}"
+    log_dir = os.path.join("runs", run_name)
+    writer = SummaryWriter(log_dir=log_dir)
+    writer.add_text("config", str(asdict(config)))
+    print(f"TensorBoard: {log_dir}")
+
+    print(f"Time budget: {TIME_BUDGET}s")
+    print(f"Device: {device}")
+
+    t_start_training = time.time()
+    smooth_train_loss = 0
+    total_training_time = 0
+    step = 0
+
+    while True:
+        model.train()
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.time()
+
+        with autocast_ctx:
+            logits = model(batch.coords, batch.node_mask)
+            loss = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                batch.targets.reshape(-1),
+                ignore_index=-1,
+            )
+
+        train_loss = loss.detach()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+        # LR schedule
+        progress = min(total_training_time / TIME_BUDGET, 1.0)
+        lrm = get_lr_multiplier(progress)
+        for group in optimizer.param_groups:
+            group["lr"] = LEARNING_RATE * lrm
+
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
+        batch, epoch = next(train_loader)
+
+        train_loss_f = train_loss.item()
+
+        # Fast fail: abort if loss is exploding
+        if train_loss_f > 100:
+            print("FAIL")
+            exit(1)
+
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t1 = time.time()
+        dt = t1 - t0
+
+        if step > 5:
+            total_training_time += dt
+
+        # Logging
+        ema_beta = 0.9
+        smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
+        debiased_smooth_loss = smooth_train_loss / (1 - ema_beta ** (step + 1))
+        pct_done = 100 * progress
+        remaining = max(0, TIME_BUDGET - total_training_time)
+
+        print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
+
+        # TensorBoard logging
+        writer.add_scalar("train/loss_raw", train_loss_f, step)
+        writer.add_scalar("train/loss_smooth", debiased_smooth_loss, step)
+        writer.add_scalar("train/lr_multiplier", lrm, step)
+        writer.add_scalar("train/step_ms", dt * 1000, step)
+        writer.add_scalar("train/epoch", epoch, step)
+        writer.add_scalar("train/progress", progress, step)
+        if device.type == "cuda":
+            writer.add_scalar("system/vram_mb", torch.cuda.memory_allocated() / 1024 / 1024, step)
+
+        # GC management (Python's GC causes stalls)
+        if step == 0:
+            gc.collect()
+            gc.freeze()
+            gc.disable()
+        elif (step + 1) % 5000 == 0:
+            gc.collect()
+
+        step += 1
+
+        # Time's up -- but only stop after warmup steps so we don't count compilation
+        if step > 5 and total_training_time >= TIME_BUDGET:
+            break
+
+    print()  # newline after \r training log
+
+    # Final scoring
+    model.eval()
     with autocast_ctx:
-        logits = model(batch.coords, batch.node_mask)
-        loss = F.cross_entropy(
-            logits.reshape(-1, logits.size(-1)),
-            batch.targets.reshape(-1),
-            ignore_index=-1,
-        )
+        metrics = run_validation(model, str(device), batch_max_residues=BATCH_MAX_RESIDUES)
 
-    train_loss = loss.detach()
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    # Final summary
+    t_end = time.time()
+    peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024 if device.type == "cuda" else 0
 
-    # LR schedule
-    progress = min(total_training_time / TIME_BUDGET, 1.0)
-    lrm = get_lr_multiplier(progress)
-    for group in optimizer.param_groups:
-        group["lr"] = LEARNING_RATE * lrm
+    # TensorBoard: final validation metrics
+    writer.add_scalar("val/nll", metrics["val_nll"], step)
+    writer.add_scalar("val/perplexity", metrics["val_perplexity"], step)
+    writer.add_scalar("val/seq_recovery", metrics["seq_recovery"], step)
 
-    optimizer.step()
-    optimizer.zero_grad(set_to_none=True)
+    # TensorBoard: hyperparameter/metric table for cross-run comparison
+    writer.add_hparams(
+        hparam_dict={
+            "d_model": D_MODEL,
+            "depth": DEPTH,
+            "nhead": NHEAD,
+            "mlp_ratio": MLP_RATIO,
+            "dropout": DROPOUT,
+            "lr": LEARNING_RATE,
+            "weight_decay": WEIGHT_DECAY,
+            "batch_max_residues": BATCH_MAX_RESIDUES,
+            "num_params_M": num_params / 1e6,
+        },
+        metric_dict={
+            "hparam/val_nll": metrics["val_nll"],
+            "hparam/val_perplexity": metrics["val_perplexity"],
+            "hparam/seq_recovery": metrics["seq_recovery"],
+            "hparam/num_steps": step,
+        },
+        run_name=".",
+    )
+    writer.close()
 
-    batch, epoch = next(train_loader)
-
-    train_loss_f = train_loss.item()
-
-    # Fast fail: abort if loss is exploding
-    if train_loss_f > 100:
-        print("FAIL")
-        exit(1)
-
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-    t1 = time.time()
-    dt = t1 - t0
-
-    if step > 5:
-        total_training_time += dt
-
-    # Logging
-    ema_beta = 0.9
-    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
-    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta ** (step + 1))
-    pct_done = 100 * progress
-    remaining = max(0, TIME_BUDGET - total_training_time)
-
-    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
-
-    # GC management (Python's GC causes stalls)
-    if step == 0:
-        gc.collect()
-        gc.freeze()
-        gc.disable()
-    elif (step + 1) % 5000 == 0:
-        gc.collect()
-
-    step += 1
-
-    # Time's up -- but only stop after warmup steps so we don't count compilation
-    if step > 5 and total_training_time >= TIME_BUDGET:
-        break
-
-print()  # newline after \r training log
-
-# Final scoring
-model.eval()
-with autocast_ctx:
-    metrics = run_validation(model, str(device), batch_max_residues=BATCH_MAX_RESIDUES)
-
-# Final summary
-t_end = time.time()
-peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024 if device.type == "cuda" else 0
-
-print("---")
-print(f"val_nll:          {metrics['val_nll']:.6f}")
-print(f"val_perplexity:   {metrics['val_perplexity']:.6f}")
-print(f"seq_recovery:     {metrics['seq_recovery']:.6f}")
-print(f"training_seconds: {total_training_time:.1f}")
-print(f"total_seconds:    {t_end - t_start:.1f}")
-print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
-print(f"num_steps:        {step}")
-print(f"num_params_M:     {num_params / 1e6:.1f}")
-print(f"depth:            {DEPTH}")
+    print("---")
+    print(f"val_nll:          {metrics['val_nll']:.6f}")
+    print(f"val_perplexity:   {metrics['val_perplexity']:.6f}")
+    print(f"seq_recovery:     {metrics['seq_recovery']:.6f}")
+    print(f"training_seconds: {total_training_time:.1f}")
+    print(f"total_seconds:    {t_end - t_start:.1f}")
+    print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
+    print(f"num_steps:        {step}")
+    print(f"num_params_M:     {num_params / 1e6:.1f}")
+    print(f"depth:            {DEPTH}")

@@ -17,6 +17,7 @@ AGENTS.md
 # Experimental artifacts
 dev/
 run.log
+runs/
 
 # Results file (untracked, each run creates fresh)
 results.tsv
